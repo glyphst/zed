@@ -219,3 +219,16 @@ fn load_poly_sprite(instance_id: u32) -> PolychromeSprite {
         read_atlas_tile(&cursor),
     );
 }
+
+fn load_external_texture(instance_id: u32) -> ExternalTextureInstance {
+    var cursor = instance_cursor(instance_id * 16u);
+    return ExternalTextureInstance(
+        read_bounds(&cursor),
+        read_bounds(&cursor),
+        read_bounds(&cursor),
+        read_f32(&cursor),
+        read_word(&cursor),
+        read_word(&cursor),
+        read_word(&cursor),
+    );
+}

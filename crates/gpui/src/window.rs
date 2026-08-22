@@ -8,10 +8,10 @@ use crate::{
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
     Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
     KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite,
-    MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
-    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
-    Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage,
-    RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
+    MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, PaintExternalTexture, Path, Pixels,
+    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
+    PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
+    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
     StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
     SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle,
@@ -4555,6 +4555,70 @@ impl Window {
         Ok(())
     }
 
+    /// Paint an externally owned GPU texture into the next frame at the
+    /// current painter order without copying its pixels through the CPU.
+    ///
+    /// `source_bounds` are normalized texture coordinates and must be fully
+    /// contained within `[0, 1]`. The external texture must belong to the
+    /// device token returned by [`Self::external_gpu_context`].
+    pub fn paint_external_texture(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        source_bounds: Bounds<f32>,
+        texture: crate::ExternalTextureHandle,
+        opacity: f32,
+        filtering: crate::ExternalTextureFilter,
+        color_space: crate::ExternalTextureColorSpace,
+        alpha_mode: crate::ExternalTextureAlphaMode,
+    ) -> Result<()> {
+        self.invalidator.debug_assert_paint();
+
+        let source_max_x = source_bounds.origin.x + source_bounds.size.width;
+        let source_max_y = source_bounds.origin.y + source_bounds.size.height;
+        let valid_source_bounds = source_bounds.origin.x.is_finite()
+            && source_bounds.origin.y.is_finite()
+            && source_bounds.size.width.is_finite()
+            && source_bounds.size.height.is_finite()
+            && source_bounds.origin.x >= 0.0
+            && source_bounds.origin.y >= 0.0
+            && source_bounds.size.width > 0.0
+            && source_bounds.size.height > 0.0
+            && source_max_x <= 1.0
+            && source_max_y <= 1.0;
+        if !valid_source_bounds {
+            return Err(anyhow!(
+                "external texture source bounds must be finite, non-empty, and within [0, 1]"
+            ));
+        }
+        if !opacity.is_finite() || !(0.0..=1.0).contains(&opacity) {
+            return Err(anyhow!("external texture opacity must be within [0, 1]"));
+        }
+        if bounds.size.width <= Pixels::ZERO || bounds.size.height <= Pixels::ZERO || opacity == 0.0
+        {
+            return Ok(());
+        }
+
+        let opacity = opacity * self.element_opacity();
+        if opacity == 0.0 {
+            return Ok(());
+        }
+
+        self.next_frame
+            .scene
+            .insert_primitive(PaintExternalTexture {
+                order: 0,
+                bounds: self.snap_bounds(bounds),
+                content_mask: self.snapped_content_mask(),
+                source_bounds,
+                opacity,
+                filtering,
+                color_space,
+                alpha_mode,
+                texture,
+            });
+        Ok(())
+    }
+
     /// Paint a surface into the scene for the next frame at the current z-index.
     ///
     /// This method should only be called as part of the paint phase of element drawing.
@@ -5963,6 +6027,12 @@ impl Window {
     /// Currently returns None on Mac and Windows.
     pub fn gpu_specs(&self) -> Option<GpuSpecs> {
         self.platform_window.gpu_specs()
+    }
+
+    /// Return the same-device GPU context for this window, when supported by
+    /// the active platform renderer.
+    pub fn external_gpu_context(&self) -> Option<crate::ExternalGpuContext> {
+        self.platform_window.external_gpu_context()
     }
 
     /// Perform titlebar double-click action.

@@ -1,10 +1,13 @@
 #[cfg(not(target_family = "wasm"))]
 use anyhow::Context as _;
+use gpui::ExternalGpuDeviceToken;
 #[cfg(not(target_family = "wasm"))]
 use gpui_util::ResultExt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use wgpu::TextureFormat;
+
+static NEXT_DEVICE_IDENTITY: AtomicU64 = AtomicU64::new(1);
 
 pub struct WgpuContext {
     pub instance: wgpu::Instance,
@@ -15,6 +18,7 @@ pub struct WgpuContext {
     dual_source_blending: bool,
     color_texture_format: wgpu::TextureFormat,
     device_lost: Arc<AtomicBool>,
+    external_device_token: ExternalGpuDeviceToken,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -69,7 +73,13 @@ impl WgpuContext {
         surface: &wgpu::Surface<'_>,
         compositor_gpu: Option<CompositorGpuHint>,
     ) -> anyhow::Result<Self> {
-        Self::new_with_options(instance, surface, compositor_gpu, false)
+        Self::new_with_options(
+            instance,
+            surface,
+            compositor_gpu,
+            false,
+            Self::fresh_external_device_token(),
+        )
     }
 
     #[cfg(not(target_family = "wasm"))]
@@ -78,7 +88,29 @@ impl WgpuContext {
         surface: &wgpu::Surface<'_>,
         compositor_gpu: Option<CompositorGpuHint>,
     ) -> anyhow::Result<Self> {
-        Self::new_with_options(instance, surface, compositor_gpu, true)
+        Self::new_with_options(
+            instance,
+            surface,
+            compositor_gpu,
+            true,
+            Self::fresh_external_device_token(),
+        )
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn new_rejecting_software_with_token(
+        instance: wgpu::Instance,
+        surface: &wgpu::Surface<'_>,
+        compositor_gpu: Option<CompositorGpuHint>,
+        external_device_token: ExternalGpuDeviceToken,
+    ) -> anyhow::Result<Self> {
+        Self::new_with_options(
+            instance,
+            surface,
+            compositor_gpu,
+            true,
+            external_device_token,
+        )
     }
 
     #[cfg(not(target_family = "wasm"))]
@@ -87,6 +119,7 @@ impl WgpuContext {
         surface: &wgpu::Surface<'_>,
         compositor_gpu: Option<CompositorGpuHint>,
         reject_software: bool,
+        external_device_token: ExternalGpuDeviceToken,
     ) -> anyhow::Result<Self> {
         let device_id_filter = match std::env::var("ZED_DEVICE_ID") {
             Ok(val) => parse_pci_id(&val)
@@ -138,6 +171,7 @@ impl WgpuContext {
             dual_source_blending,
             color_texture_format,
             device_lost,
+            external_device_token,
         })
     }
 
@@ -229,6 +263,7 @@ impl WgpuContext {
             dual_source_blending,
             color_texture_format,
             device_lost,
+            external_device_token: Self::fresh_external_device_token(),
         };
         Ok(PreparedWebGraphics { context, surface })
     }
@@ -553,6 +588,10 @@ impl WgpuContext {
         self.color_texture_format
     }
 
+    pub(crate) fn external_device_token(&self) -> ExternalGpuDeviceToken {
+        self.external_device_token
+    }
+
     /// Returns true if the GPU device was lost (e.g., due to driver crash, suspend/resume).
     /// When this returns true, the context should be recreated.
     pub fn device_lost(&self) -> bool {
@@ -562,6 +601,10 @@ impl WgpuContext {
     /// Returns a clone of the device_lost flag for sharing with renderers.
     pub(crate) fn device_lost_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.device_lost)
+    }
+
+    fn fresh_external_device_token() -> ExternalGpuDeviceToken {
+        ExternalGpuDeviceToken::new(NEXT_DEVICE_IDENTITY.fetch_add(1, Ordering::Relaxed), 1)
     }
 }
 

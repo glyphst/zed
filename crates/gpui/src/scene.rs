@@ -5,8 +5,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Pixels,
-    Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
+    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges,
+    ExternalTextureHandle, Hsla, Pixels, Point, Radians, ScaledPixels, Size,
+    bounds_tree::BoundsTree, point,
 };
 use std::{
     fmt::Debug,
@@ -49,6 +50,7 @@ pub struct Scene {
     pub monochrome_sprites: Vec<MonochromeSprite>,
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
+    pub external_textures: Vec<PaintExternalTexture>,
     pub surfaces: Vec<PaintSurface>,
 }
 
@@ -65,6 +67,7 @@ impl Scene {
         self.monochrome_sprites.clear();
         self.subpixel_sprites.clear();
         self.polychrome_sprites.clear();
+        self.external_textures.clear();
         self.surfaces.clear();
     }
 
@@ -129,6 +132,10 @@ impl Scene {
                 sprite.order = order;
                 self.polychrome_sprites.push(*sprite);
             }
+            Primitive::ExternalTexture(texture) => {
+                texture.order = order;
+                self.external_textures.push(texture.clone());
+            }
             Primitive::Surface(surface) => {
                 surface.order = order;
                 self.surfaces.push(surface.clone());
@@ -159,6 +166,7 @@ impl Scene {
             .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
         self.polychrome_sprites
             .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
+        self.external_textures.sort_by_key(|texture| texture.order);
         self.surfaces.sort_by_key(|surface| surface.order);
     }
 
@@ -185,6 +193,8 @@ impl Scene {
             subpixel_sprites_iter: self.subpixel_sprites.iter().peekable(),
             polychrome_sprites_start: 0,
             polychrome_sprites_iter: self.polychrome_sprites.iter().peekable(),
+            external_textures_start: 0,
+            external_textures_iter: self.external_textures.iter().peekable(),
             surfaces_start: 0,
             surfaces_iter: self.surfaces.iter().peekable(),
         }
@@ -208,6 +218,7 @@ pub(crate) enum PrimitiveKind {
     MonochromeSprite,
     SubpixelSprite,
     PolychromeSprite,
+    ExternalTexture,
     Surface,
 }
 
@@ -227,6 +238,7 @@ pub enum Primitive {
     MonochromeSprite(MonochromeSprite),
     SubpixelSprite(SubpixelSprite),
     PolychromeSprite(PolychromeSprite),
+    ExternalTexture(PaintExternalTexture),
     Surface(PaintSurface),
 }
 
@@ -241,6 +253,7 @@ impl Primitive {
             Primitive::MonochromeSprite(sprite) => &sprite.bounds,
             Primitive::SubpixelSprite(sprite) => &sprite.bounds,
             Primitive::PolychromeSprite(sprite) => &sprite.bounds,
+            Primitive::ExternalTexture(texture) => &texture.bounds,
             Primitive::Surface(surface) => &surface.bounds,
         }
     }
@@ -254,6 +267,7 @@ impl Primitive {
             Primitive::MonochromeSprite(sprite) => &sprite.content_mask,
             Primitive::SubpixelSprite(sprite) => &sprite.content_mask,
             Primitive::PolychromeSprite(sprite) => &sprite.content_mask,
+            Primitive::ExternalTexture(texture) => &texture.content_mask,
             Primitive::Surface(surface) => &surface.content_mask,
         }
     }
@@ -281,6 +295,8 @@ struct BatchIterator<'a> {
     subpixel_sprites_iter: Peekable<slice::Iter<'a, SubpixelSprite>>,
     polychrome_sprites_start: usize,
     polychrome_sprites_iter: Peekable<slice::Iter<'a, PolychromeSprite>>,
+    external_textures_start: usize,
+    external_textures_iter: Peekable<slice::Iter<'a, PaintExternalTexture>>,
     surfaces_start: usize,
     surfaces_iter: Peekable<slice::Iter<'a, PaintSurface>>,
 }
@@ -311,6 +327,10 @@ impl<'a> Iterator for BatchIterator<'a> {
             (
                 self.polychrome_sprites_iter.peek().map(|s| s.order),
                 PrimitiveKind::PolychromeSprite,
+            ),
+            (
+                self.external_textures_iter.peek().map(|t| t.order),
+                PrimitiveKind::ExternalTexture,
             ),
             (
                 self.surfaces_iter.peek().map(|s| s.order),
@@ -447,6 +467,22 @@ impl<'a> Iterator for BatchIterator<'a> {
                     range: sprites_start..sprites_end,
                 })
             }
+            PrimitiveKind::ExternalTexture => {
+                let textures_start = self.external_textures_start;
+                let mut textures_end = textures_start + 1;
+                self.external_textures_iter.next();
+                while self
+                    .external_textures_iter
+                    .next_if(|texture| (texture.order, batch_kind) < max_order_and_kind)
+                    .is_some()
+                {
+                    textures_end += 1;
+                }
+                self.external_textures_start = textures_end;
+                Some(PrimitiveBatch::ExternalTextures(
+                    textures_start..textures_end,
+                ))
+            }
             PrimitiveKind::Surface => {
                 let surfaces_start = self.surfaces_start;
                 let mut surfaces_end = surfaces_start + 1;
@@ -492,6 +528,7 @@ pub enum PrimitiveBatch {
         texture_id: AtlasTextureId,
         range: Range<usize>,
     },
+    ExternalTextures(Range<usize>),
     Surfaces(Range<usize>),
 }
 
@@ -524,6 +561,7 @@ impl PrimitiveBatch {
                     texture_id.index
                 )
             }
+            Self::ExternalTextures(range) => format!("external textures ({})", range.len()),
             Self::Surfaces(range) => format!("surfaces ({})", range.len()),
         }
     }
@@ -763,6 +801,71 @@ impl From<PolychromeSprite> for Primitive {
     }
 }
 
+/// Filtering used when sampling an external GPU texture.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[repr(u32)]
+pub enum ExternalTextureFilter {
+    /// Select the nearest source texel.
+    Nearest = 0,
+    /// Linearly interpolate adjacent source texels.
+    #[default]
+    Linear = 1,
+}
+
+/// The color encoding of values returned when sampling an external texture.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[repr(u32)]
+pub enum ExternalTextureColorSpace {
+    /// Samples are already linear sRGB values. This is also the correct choice
+    /// for an sRGB WGPU texture view, because sampling performs the decode.
+    #[default]
+    LinearSrgb = 0,
+    /// Samples contain sRGB-encoded channel values that GPUI must linearize.
+    Srgb = 1,
+}
+
+/// The alpha representation of an external texture.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[repr(u32)]
+pub enum ExternalTextureAlphaMode {
+    /// Ignore the sampled alpha channel and treat every texel as opaque.
+    Opaque = 0,
+    /// RGB channels are independent of alpha.
+    Straight = 1,
+    /// RGB channels have already been multiplied by alpha.
+    #[default]
+    Premultiplied = 2,
+}
+
+/// An externally owned GPU texture placed into GPUI's ordered paint scene.
+#[derive(Clone, Debug)]
+pub struct PaintExternalTexture {
+    /// Painter order assigned when the primitive is inserted into a scene.
+    pub order: DrawOrder,
+    /// Destination bounds in device-scaled pixels.
+    pub bounds: Bounds<ScaledPixels>,
+    /// Destination clip bounds in device-scaled pixels.
+    pub content_mask: ContentMask<ScaledPixels>,
+    /// Normalized source texture coordinates, normally within `[0, 1]`.
+    pub source_bounds: Bounds<f32>,
+    /// Opacity multiplied into the sampled texture alpha.
+    pub opacity: f32,
+    /// Source sampling mode.
+    pub filtering: ExternalTextureFilter,
+    /// Source color encoding.
+    pub color_space: ExternalTextureColorSpace,
+    /// Source alpha representation.
+    pub alpha_mode: ExternalTextureAlphaMode,
+    /// Opaque backend texture handle.
+    pub texture: ExternalTextureHandle,
+}
+
+impl From<PaintExternalTexture> for Primitive {
+    fn from(texture: PaintExternalTexture) -> Self {
+        Primitive::ExternalTexture(texture)
+    }
+}
+
 #[derive(Clone, Debug)]
 #[allow(missing_docs)]
 pub struct PaintSurface {
@@ -945,5 +1048,63 @@ impl PathVertex<Pixels> {
             st_position: self.st_position,
             content_mask: self.content_mask.scale(factor),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ExternalGpuDeviceToken, ExternalTextureHandle};
+
+    #[test]
+    fn external_textures_keep_overlapping_painter_order() {
+        let bounds = Bounds {
+            origin: Point::new(ScaledPixels(0.0), ScaledPixels(0.0)),
+            size: Size {
+                width: ScaledPixels(100.0),
+                height: ScaledPixels(100.0),
+            },
+        };
+        let content_mask = ContentMask { bounds };
+        let mut scene = Scene::default();
+
+        scene.insert_primitive(Quad {
+            bounds,
+            content_mask,
+            ..Quad::default()
+        });
+        scene.insert_primitive(PaintExternalTexture {
+            order: 0,
+            bounds,
+            content_mask,
+            source_bounds: Bounds {
+                origin: Point::new(0.0, 0.0),
+                size: Size {
+                    width: 1.0,
+                    height: 1.0,
+                },
+            },
+            opacity: 1.0,
+            filtering: ExternalTextureFilter::Linear,
+            color_space: ExternalTextureColorSpace::LinearSrgb,
+            alpha_mode: ExternalTextureAlphaMode::Premultiplied,
+            texture: ExternalTextureHandle::new(ExternalGpuDeviceToken::new(1, 1), ()),
+        });
+        scene.insert_primitive(Quad {
+            bounds,
+            content_mask,
+            ..Quad::default()
+        });
+        scene.finish();
+
+        let labels = scene
+            .batches()
+            .map(|batch| batch.label())
+            .collect::<Vec<_>>();
+        assert_eq!(labels, ["quads (1)", "external textures (1)", "quads (1)"]);
+
+        scene.clear();
+        assert!(scene.external_textures.is_empty());
+        assert_eq!(scene.len(), 0);
     }
 }

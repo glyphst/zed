@@ -1901,6 +1901,10 @@ impl PlatformWindow for WaylandWindow {
         self.borrow().renderer.gpu_specs().into()
     }
 
+    fn external_gpu_context(&self) -> Option<gpui::ExternalGpuContext> {
+        Some(self.borrow().renderer.external_gpu_context())
+    }
+
     fn play_system_bell(&self) {
         let state = self.borrow();
         let surface = if state.surface_state.toplevel().is_some() {

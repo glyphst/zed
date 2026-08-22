@@ -1,14 +1,17 @@
-use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
+use crate::external_texture::WgpuExternalTexture;
+use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext, WgpuExternalContext};
 use anyhow::{Context as _, Result};
 use bytemuck::{Pod, Zeroable};
 use gpui::{
-    AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, Path, Point, PrimitiveBatch,
-    ScaledPixels, Scene, Size, get_gamma_correction_ratios,
+    AtlasTextureId, Background, Bounds, DevicePixels, ExternalGpuContext, ExternalGpuDeviceToken,
+    ExternalTextureFilter, ExternalTextureId, GpuSpecs, Path, Point, PrimitiveBatch, ScaledPixels,
+    Scene, Size, get_gamma_correction_ratios,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU64;
 use std::ops::Range;
 use std::rc::Rc;
@@ -77,11 +80,32 @@ impl From<Bounds<ScaledPixels>> for PodBounds {
     }
 }
 
+impl From<Bounds<f32>> for PodBounds {
+    fn from(bounds: Bounds<f32>) -> Self {
+        Self {
+            origin: [bounds.origin.x, bounds.origin.y],
+            size: [bounds.size.width, bounds.size.height],
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct SurfaceParams {
     bounds: PodBounds,
     content_mask: PodBounds,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct ExternalTextureInstance {
+    bounds: PodBounds,
+    content_mask: PodBounds,
+    source_bounds: PodBounds,
+    opacity: f32,
+    color_space: u32,
+    alpha_mode: u32,
+    pad: u32,
 }
 
 #[repr(C)]
@@ -130,6 +154,7 @@ struct WgpuPipelines {
     mono_sprites: wgpu::RenderPipeline,
     subpixel_sprites: Option<wgpu::RenderPipeline>,
     poly_sprites: wgpu::RenderPipeline,
+    external_textures: wgpu::RenderPipeline,
     #[allow(dead_code)]
     surfaces: wgpu::RenderPipeline,
 }
@@ -152,6 +177,7 @@ struct InstanceBindings {
     monochrome_sprites: InstanceBinding,
     subpixel_sprites: InstanceBinding,
     polychrome_sprites: InstanceBinding,
+    external_textures: InstanceBinding,
 }
 
 struct WgpuBindGroupLayouts {
@@ -184,6 +210,9 @@ struct WgpuResources {
     pipelines: WgpuPipelines,
     bind_group_layouts: WgpuBindGroupLayouts,
     atlas_sampler: wgpu::Sampler,
+    external_nearest_sampler: wgpu::Sampler,
+    external_texture_bind_groups:
+        HashMap<(ExternalTextureId, ExternalTextureFilter), wgpu::BindGroup>,
     globals_buffer: wgpu::Buffer,
     globals_bind_group: wgpu::BindGroup,
     path_globals_bind_group: wgpu::BindGroup,
@@ -229,6 +258,7 @@ pub struct WgpuRenderer {
     last_error: Arc<Mutex<Option<String>>>,
     failed_frame_count: u32,
     device_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    external_device_token: ExternalGpuDeviceToken,
     surface_configured: bool,
     needs_redraw: bool,
 }
@@ -450,6 +480,18 @@ impl WgpuRenderer {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
+        // A nearest min/mag sampler with linear mip filtering remains a
+        // filtering sampler for bind-group validation. External presentation
+        // clamps to mip level zero, so the mip filter cannot blur the source.
+        let external_nearest_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("external_nearest_sampler"),
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            lod_min_clamp: 0.0,
+            lod_max_clamp: 0.0,
+            ..Default::default()
+        });
 
         let uniform_alignment = device.limits().min_uniform_buffer_offset_alignment as u64;
         let globals_size = std::mem::size_of::<GlobalParams>() as u64;
@@ -568,6 +610,8 @@ impl WgpuRenderer {
             pipelines,
             bind_group_layouts,
             atlas_sampler,
+            external_nearest_sampler,
+            external_texture_bind_groups: HashMap::new(),
             globals_buffer,
             globals_bind_group,
             path_globals_bind_group,
@@ -602,6 +646,7 @@ impl WgpuRenderer {
             last_error,
             failed_frame_count: 0,
             device_lost: context.device_lost_flag(),
+            external_device_token: context.external_device_token(),
             surface_configured: true,
             needs_redraw: false,
         })
@@ -1041,6 +1086,19 @@ impl WgpuRenderer {
             &shader_module,
         );
 
+        let external_textures = create_pipeline(
+            "external_textures",
+            "vs_external_texture",
+            "fs_external_texture",
+            &layouts.globals,
+            &layouts.instances,
+            Some(&layouts.texture),
+            wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(color_target.clone())],
+            1,
+            &shader_module,
+        );
+
         let surfaces = create_pipeline(
             "surfaces",
             "vs_surface",
@@ -1063,6 +1121,7 @@ impl WgpuRenderer {
             mono_sprites,
             subpixel_sprites,
             poly_sprites,
+            external_textures,
             surfaces,
         }
     }
@@ -1258,6 +1317,20 @@ impl WgpuRenderer {
         }
     }
 
+    /// Returns the WGPU device/queue payload and recovery token used by this renderer.
+    pub fn external_gpu_context(&self) -> ExternalGpuContext {
+        let resources = self.resources();
+        ExternalGpuContext::new(
+            self.external_device_token,
+            WgpuExternalContext::new(
+                Arc::clone(&resources.device),
+                Arc::clone(&resources.queue),
+                self.external_device_token,
+                Arc::clone(&self.device_lost),
+            ),
+        )
+    }
+
     pub fn max_texture_size(&self) -> u32 {
         self.max_texture_size
     }
@@ -1403,12 +1476,13 @@ impl WgpuRenderer {
     }
 
     fn record_frame(&mut self, scene: &Scene, frame_view: &wgpu::TextureView) -> Result<()> {
+        self.prepare_external_texture_bind_groups(scene)?;
         let mut instance_offset = 0;
         let instance_bindings = self
             .write_instances(scene, &mut instance_offset)
             .with_context(|| {
                 format!(
-                    "scene too large: {} paths, {} shadows, {} quads, {} underlines, {} monochrome sprites, {} subpixel sprites, {} polychrome sprites",
+                    "scene too large: {} paths, {} shadows, {} quads, {} underlines, {} monochrome sprites, {} subpixel sprites, {} polychrome sprites, {} external textures",
                     scene.paths.len(),
                     scene.shadows.len(),
                     scene.quads.len(),
@@ -1416,6 +1490,7 @@ impl WgpuRenderer {
                     scene.monochrome_sprites.len(),
                     scene.subpixel_sprites.len(),
                     scene.polychrome_sprites.len(),
+                    scene.external_textures.len(),
                 )
             })?;
 
@@ -1526,6 +1601,12 @@ impl WgpuRenderer {
                         instance_range(range),
                         &mut pass,
                     ),
+                    PrimitiveBatch::ExternalTextures(range) => self.draw_external_textures(
+                        scene,
+                        &instance_bindings.external_textures,
+                        range,
+                        &mut pass,
+                    )?,
                     // Surfaces are macOS-only for video playback and are not
                     // implemented by the WGPU renderer.
                     PrimitiveBatch::Surfaces(_surfaces) => {}
@@ -1544,6 +1625,20 @@ impl WgpuRenderer {
         scene: &Scene,
         instance_offset: &mut u64,
     ) -> Result<InstanceBindings> {
+        let external_textures = scene
+            .external_textures
+            .iter()
+            .map(|texture| ExternalTextureInstance {
+                bounds: texture.bounds.into(),
+                content_mask: texture.content_mask.bounds.into(),
+                source_bounds: texture.source_bounds.into(),
+                opacity: texture.opacity,
+                color_space: texture.color_space as u32,
+                alpha_mode: texture.alpha_mode as u32,
+                pad: 0,
+            })
+            .collect::<Vec<_>>();
+
         Ok(InstanceBindings {
             quads: self.write_instance_binding(
                 "quads_bind_group",
@@ -1575,6 +1670,11 @@ impl WgpuRenderer {
                 instance_offset,
                 &scene.polychrome_sprites,
             )?,
+            external_textures: self.write_instance_binding(
+                "external_textures_bind_group",
+                instance_offset,
+                &external_textures,
+            )?,
         })
     }
 
@@ -1600,6 +1700,70 @@ impl WgpuRenderer {
                     },
                 ],
             })
+    }
+
+    fn prepare_external_texture_bind_groups(&mut self, scene: &Scene) -> Result<()> {
+        let mut active = HashSet::with_capacity(scene.external_textures.len());
+
+        for texture in &scene.external_textures {
+            anyhow::ensure!(
+                texture.texture.token() == self.external_device_token,
+                "external texture {} belongs to device {:?}, but this window uses {:?}",
+                texture.texture.id().as_u64(),
+                texture.texture.token(),
+                self.external_device_token,
+            );
+            let payload = texture
+                .texture
+                .downcast_ref::<WgpuExternalTexture>()
+                .with_context(|| {
+                    format!(
+                        "external texture {} is not a WGPU texture payload",
+                        texture.texture.id().as_u64()
+                    )
+                })?;
+            let key = (texture.texture.id(), texture.filtering);
+            active.insert(key);
+            if self
+                .resources()
+                .external_texture_bind_groups
+                .contains_key(&key)
+            {
+                continue;
+            }
+
+            let bind_group = {
+                let resources = self.resources();
+                let sampler = match texture.filtering {
+                    ExternalTextureFilter::Nearest => &resources.external_nearest_sampler,
+                    ExternalTextureFilter::Linear => &resources.atlas_sampler,
+                };
+                resources
+                    .device
+                    .create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("external_texture_bind_group"),
+                        layout: &resources.bind_group_layouts.texture,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: wgpu::BindingResource::TextureView(&payload.view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::Sampler(sampler),
+                            },
+                        ],
+                    })
+            };
+            self.resources_mut()
+                .external_texture_bind_groups
+                .insert(key, bind_group);
+        }
+
+        self.resources_mut()
+            .external_texture_bind_groups
+            .retain(|key, _| active.contains(key));
+        Ok(())
     }
 
     fn draw_instances(
@@ -1644,6 +1808,37 @@ impl WgpuRenderer {
             sprite_instances.first_instance + range.start
                 ..sprite_instances.first_instance + range.end,
         );
+    }
+
+    fn draw_external_textures(
+        &self,
+        scene: &Scene,
+        instances: &InstanceBinding,
+        range: Range<usize>,
+        pass: &mut wgpu::RenderPass<'_>,
+    ) -> Result<()> {
+        let resources = self.resources();
+        pass.set_pipeline(&resources.pipelines.external_textures);
+        pass.set_bind_group(0, &resources.globals_bind_group, &[]);
+        pass.set_bind_group(1, &instances.bind_group, &[]);
+
+        for index in range {
+            let texture = &scene.external_textures[index];
+            let key = (texture.texture.id(), texture.filtering);
+            let bind_group = resources
+                .external_texture_bind_groups
+                .get(&key)
+                .with_context(|| {
+                    format!(
+                        "external texture {} was not prepared",
+                        texture.texture.id().as_u64()
+                    )
+                })?;
+            pass.set_bind_group(2, bind_group, &[]);
+            let instance = instances.first_instance + index as u32;
+            pass.draw(0..4, instance..instance + 1);
+        }
+        Ok(())
     }
 
     unsafe fn instance_bytes<T>(instances: &[T]) -> &[u8] {
@@ -2082,6 +2277,11 @@ impl WgpuRenderer {
         let surface = if needs_new_context {
             log::warn!("GPU device lost, recreating context...");
 
+            let next_external_device_token = gpu_context
+                .borrow()
+                .as_ref()
+                .map(|context| context.external_device_token().next_generation());
+
             // Drop old resources to release Arc<Device>/Arc<Queue> and GPU resources
             self.resources = None;
             *gpu_context.borrow_mut() = None;
@@ -2094,8 +2294,16 @@ impl WgpuRenderer {
 
             let instance = WgpuContext::instance(Box::new(window.clone()));
             let surface = create_surface(&instance, window_handle.as_raw())?;
-            let new_context =
-                WgpuContext::new_rejecting_software(instance, &surface, self.compositor_gpu)?;
+            let new_context = if let Some(token) = next_external_device_token {
+                WgpuContext::new_rejecting_software_with_token(
+                    instance,
+                    &surface,
+                    self.compositor_gpu,
+                    token,
+                )?
+            } else {
+                WgpuContext::new_rejecting_software(instance, &surface, self.compositor_gpu)?
+            };
             *gpu_context.borrow_mut() = Some(new_context);
             surface
         } else {
@@ -2239,5 +2447,6 @@ mod tests {
         assert_eq!(std::mem::size_of::<MonochromeSprite>(), 28 * 4);
         assert_eq!(std::mem::size_of::<SubpixelSprite>(), 28 * 4);
         assert_eq!(std::mem::size_of::<PolychromeSprite>(), 24 * 4);
+        assert_eq!(std::mem::size_of::<ExternalTextureInstance>(), 16 * 4);
     }
 }

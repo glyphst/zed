@@ -1310,6 +1310,66 @@ fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
     return blend_color(color, sprite.opacity * saturate(0.5 - distance));
 }
 
+// --- external textures --- //
+
+struct ExternalTextureInstance {
+    bounds: Bounds,
+    content_mask: Bounds,
+    source_bounds: Bounds,
+    opacity: f32,
+    color_space: u32,
+    alpha_mode: u32,
+    pad: u32,
+}
+
+struct ExternalTextureVarying {
+    @builtin(position) position: vec4<f32>,
+    @location(0) texture_position: vec2<f32>,
+    @location(1) @interpolate(flat) texture_id: u32,
+    @location(2) clip_distances: vec4<f32>,
+}
+
+@vertex
+fn vs_external_texture(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance_id: u32) -> ExternalTextureVarying {
+    let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
+    let texture = load_external_texture(instance_id);
+
+    var out = ExternalTextureVarying();
+    out.position = to_device_position(unit_vertex, texture.bounds);
+    out.texture_position = texture.source_bounds.origin + unit_vertex * texture.source_bounds.size;
+    out.texture_id = instance_id;
+    out.clip_distances = distance_from_clip_rect(unit_vertex, texture.bounds, texture.content_mask);
+    return out;
+}
+
+@fragment
+fn fs_external_texture(input: ExternalTextureVarying) -> @location(0) vec4<f32> {
+    var color = textureSampleLevel(t_sprite, s_sprite, input.texture_position, 0.0);
+
+    // Clip after sampling so derivatives and texture behavior remain uniform
+    // along a primitive edge.
+    if (any(input.clip_distances < vec4<f32>(0.0))) {
+        return vec4<f32>(0.0);
+    }
+
+    let texture = load_external_texture(input.texture_id);
+    if (texture.color_space == 1u) {
+        color = vec4<f32>(srgb_to_linear(color.rgb), color.a);
+    }
+
+    if (texture.alpha_mode == 0u) {
+        color.a = 1.0;
+    } else if (texture.alpha_mode == 2u) {
+        if (color.a > 0.0) {
+            color = vec4<f32>(color.rgb / color.a, color.a);
+        } else {
+            color = vec4<f32>(0.0);
+        }
+    }
+
+    return blend_color(color, texture.opacity);
+}
+
 // --- surfaces --- //
 
 struct SurfaceParams {
