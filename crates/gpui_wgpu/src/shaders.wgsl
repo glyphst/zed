@@ -1319,7 +1319,7 @@ struct ExternalTextureInstance {
     opacity: f32,
     color_space: u32,
     alpha_mode: u32,
-    pad: u32,
+    color_effect: u32,
 }
 
 struct ExternalTextureVarying {
@@ -1365,6 +1365,10 @@ fn fs_external_texture(input: ExternalTextureVarying) -> @location(0) vec4<f32> 
         } else {
             color = vec4<f32>(0.0);
         }
+    }
+
+    if (texture.color_effect == 1u) {
+        color = vec4<f32>(vec3<f32>(1.0) - color.rgb, color.a);
     }
 
     return blend_color(color, texture.opacity);

@@ -105,7 +105,7 @@ struct ExternalTextureInstance {
     opacity: f32,
     color_space: u32,
     alpha_mode: u32,
-    pad: u32,
+    color_effect: u32,
 }
 
 #[repr(C)]
@@ -1635,7 +1635,7 @@ impl WgpuRenderer {
                 opacity: texture.opacity,
                 color_space: texture.color_space as u32,
                 alpha_mode: texture.alpha_mode as u32,
-                pad: 0,
+                color_effect: texture.color_effect as u32,
             })
             .collect::<Vec<_>>();
 

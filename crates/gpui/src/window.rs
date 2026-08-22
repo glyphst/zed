@@ -4571,6 +4571,32 @@ impl Window {
         color_space: crate::ExternalTextureColorSpace,
         alpha_mode: crate::ExternalTextureAlphaMode,
     ) -> Result<()> {
+        self.paint_external_texture_with_effect(
+            bounds,
+            source_bounds,
+            texture,
+            opacity,
+            filtering,
+            color_space,
+            alpha_mode,
+            crate::ExternalTextureColorEffect::None,
+        )
+    }
+
+    /// Paint an externally owned GPU texture with a color operation applied
+    /// after source decoding and before compositing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn paint_external_texture_with_effect(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        source_bounds: Bounds<f32>,
+        texture: crate::ExternalTextureHandle,
+        opacity: f32,
+        filtering: crate::ExternalTextureFilter,
+        color_space: crate::ExternalTextureColorSpace,
+        alpha_mode: crate::ExternalTextureAlphaMode,
+        color_effect: crate::ExternalTextureColorEffect,
+    ) -> Result<()> {
         self.invalidator.debug_assert_paint();
 
         let source_max_x = source_bounds.origin.x + source_bounds.size.width;
@@ -4614,6 +4640,7 @@ impl Window {
                 filtering,
                 color_space,
                 alpha_mode,
+                color_effect,
                 texture,
             });
         Ok(())

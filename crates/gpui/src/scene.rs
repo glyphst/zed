@@ -837,6 +837,17 @@ pub enum ExternalTextureAlphaMode {
     Premultiplied = 2,
 }
 
+/// Optional color operation applied after decoding an external texture sample.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[repr(u32)]
+pub enum ExternalTextureColorEffect {
+    /// Preserve the decoded sample.
+    #[default]
+    None = 0,
+    /// Replace every straight RGB component with its complement.
+    InvertRgb = 1,
+}
+
 /// An externally owned GPU texture placed into GPUI's ordered paint scene.
 #[derive(Clone, Debug)]
 pub struct PaintExternalTexture {
@@ -856,6 +867,8 @@ pub struct PaintExternalTexture {
     pub color_space: ExternalTextureColorSpace,
     /// Source alpha representation.
     pub alpha_mode: ExternalTextureAlphaMode,
+    /// Color operation applied before the sample is composited.
+    pub color_effect: ExternalTextureColorEffect,
     /// Opaque backend texture handle.
     pub texture: ExternalTextureHandle,
 }
@@ -1088,6 +1101,7 @@ mod tests {
             filtering: ExternalTextureFilter::Linear,
             color_space: ExternalTextureColorSpace::LinearSrgb,
             alpha_mode: ExternalTextureAlphaMode::Premultiplied,
+            color_effect: ExternalTextureColorEffect::InvertRgb,
             texture: ExternalTextureHandle::new(ExternalGpuDeviceToken::new(1, 1), ()),
         });
         scene.insert_primitive(Quad {
@@ -1096,6 +1110,11 @@ mod tests {
             ..Quad::default()
         });
         scene.finish();
+
+        assert_eq!(
+            scene.external_textures[0].color_effect,
+            ExternalTextureColorEffect::InvertRgb
+        );
 
         let labels = scene
             .batches()
