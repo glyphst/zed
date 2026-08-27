@@ -2,7 +2,7 @@ use std::{
     any::Any,
     fmt,
     sync::{
-        Arc,
+        Arc, Weak,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -139,12 +139,71 @@ impl ExternalTextureHandle {
         self.token
     }
 
+    /// Returns a non-owning handle that can be used to associate renderer-side
+    /// caches with the lifetime of this external texture.
+    pub fn downgrade(&self) -> WeakExternalTextureHandle {
+        WeakExternalTextureHandle {
+            id: self.id,
+            token: self.token,
+            payload: Arc::downgrade(&self.payload),
+        }
+    }
+
     /// Downcasts the opaque backend payload.
     pub fn downcast_ref<T>(&self) -> Option<&T>
     where
         T: Any + Send + Sync,
     {
         self.payload.downcast_ref()
+    }
+}
+
+/// A non-owning reference to an external texture handle.
+///
+/// Platform renderers use this to keep derived resources, such as bind groups,
+/// alive while the application retains the texture without making those
+/// derived resources extend the texture's lifetime.
+#[derive(Clone)]
+pub struct WeakExternalTextureHandle {
+    id: ExternalTextureId,
+    token: ExternalGpuDeviceToken,
+    payload: Weak<dyn Any + Send + Sync>,
+}
+
+impl WeakExternalTextureHandle {
+    /// Returns the process-local texture identifier.
+    pub const fn id(&self) -> ExternalTextureId {
+        self.id
+    }
+
+    /// Returns the GPU device token this texture was created with.
+    pub const fn token(&self) -> ExternalGpuDeviceToken {
+        self.token
+    }
+
+    /// Upgrades this reference while the external texture is still retained.
+    pub fn upgrade(&self) -> Option<ExternalTextureHandle> {
+        self.payload.upgrade().map(|payload| ExternalTextureHandle {
+            id: self.id,
+            token: self.token,
+            payload,
+        })
+    }
+
+    /// Returns whether an owning handle still exists.
+    pub fn is_alive(&self) -> bool {
+        self.payload.strong_count() != 0
+    }
+}
+
+impl fmt::Debug for WeakExternalTextureHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WeakExternalTextureHandle")
+            .field("id", &self.id)
+            .field("token", &self.token)
+            .field("alive", &self.is_alive())
+            .finish()
     }
 }
 
@@ -177,5 +236,26 @@ mod tests {
         assert_eq!(texture.token(), token);
         assert_eq!(texture.downcast_ref::<u32>(), Some(&42));
         assert_eq!(token.next_generation(), ExternalGpuDeviceToken::new(7, 3));
+    }
+
+    #[test]
+    fn weak_texture_handles_do_not_extend_texture_lifetime() {
+        let token = ExternalGpuDeviceToken::new(9, 1);
+        let texture = ExternalTextureHandle::new(token, 42_u32);
+        let weak = texture.downgrade();
+
+        assert_eq!(weak.id(), texture.id());
+        assert_eq!(weak.token(), token);
+        assert!(weak.is_alive());
+        assert_eq!(
+            weak.upgrade()
+                .and_then(|texture| texture.downcast_ref::<u32>().copied()),
+            Some(42)
+        );
+
+        drop(texture);
+
+        assert!(!weak.is_alive());
+        assert!(weak.upgrade().is_none());
     }
 }

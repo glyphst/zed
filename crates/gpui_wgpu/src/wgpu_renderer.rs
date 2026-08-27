@@ -5,13 +5,13 @@ use bytemuck::{Pod, Zeroable};
 use gpui::{
     AtlasTextureId, Background, Bounds, DevicePixels, ExternalGpuContext, ExternalGpuDeviceToken,
     ExternalTextureFilter, ExternalTextureId, GpuSpecs, Path, Point, PrimitiveBatch, ScaledPixels,
-    Scene, Size, get_gamma_correction_ratios,
+    Scene, Size, WeakExternalTextureHandle, get_gamma_correction_ratios,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::ops::Range;
 use std::rc::Rc;
@@ -187,6 +187,11 @@ struct WgpuBindGroupLayouts {
     surfaces: wgpu::BindGroupLayout,
 }
 
+struct ExternalTextureBindGroup {
+    bind_group: wgpu::BindGroup,
+    lifetime: WeakExternalTextureHandle,
+}
+
 /// Shared GPU context reference, used to coordinate device recovery across multiple windows.
 pub type GpuContext = Rc<RefCell<Option<WgpuContext>>>;
 
@@ -212,7 +217,7 @@ struct WgpuResources {
     atlas_sampler: wgpu::Sampler,
     external_nearest_sampler: wgpu::Sampler,
     external_texture_bind_groups:
-        HashMap<(ExternalTextureId, ExternalTextureFilter), wgpu::BindGroup>,
+        HashMap<(ExternalTextureId, ExternalTextureFilter), ExternalTextureBindGroup>,
     globals_buffer: wgpu::Buffer,
     globals_bind_group: wgpu::BindGroup,
     path_globals_bind_group: wgpu::BindGroup,
@@ -1703,8 +1708,6 @@ impl WgpuRenderer {
     }
 
     fn prepare_external_texture_bind_groups(&mut self, scene: &Scene) -> Result<()> {
-        let mut active = HashSet::with_capacity(scene.external_textures.len());
-
         for texture in &scene.external_textures {
             anyhow::ensure!(
                 texture.texture.token() == self.external_device_token,
@@ -1723,7 +1726,6 @@ impl WgpuRenderer {
                     )
                 })?;
             let key = (texture.texture.id(), texture.filtering);
-            active.insert(key);
             if self
                 .resources()
                 .external_texture_bind_groups
@@ -1755,14 +1757,18 @@ impl WgpuRenderer {
                         ],
                     })
             };
-            self.resources_mut()
-                .external_texture_bind_groups
-                .insert(key, bind_group);
+            self.resources_mut().external_texture_bind_groups.insert(
+                key,
+                ExternalTextureBindGroup {
+                    bind_group,
+                    lifetime: texture.texture.downgrade(),
+                },
+            );
         }
 
         self.resources_mut()
             .external_texture_bind_groups
-            .retain(|key, _| active.contains(key));
+            .retain(|_, entry| entry.lifetime.is_alive());
         Ok(())
     }
 
@@ -1834,7 +1840,7 @@ impl WgpuRenderer {
                         texture.texture.id().as_u64()
                     )
                 })?;
-            pass.set_bind_group(2, bind_group, &[]);
+            pass.set_bind_group(2, &bind_group.bind_group, &[]);
             let instance = instances.first_instance + index as u32;
             pass.draw(0..4, instance..instance + 1);
         }
