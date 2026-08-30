@@ -300,6 +300,7 @@ impl WgpuContext {
         let required_limits = wgpu::Limits::downlevel_defaults()
             .using_resolution(adapter.limits())
             .using_alignment(adapter.limits());
+        let required_limits = limits_for_external_clients(required_limits, adapter.limits());
 
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
@@ -608,6 +609,21 @@ impl WgpuContext {
     }
 }
 
+fn limits_for_external_clients(required: wgpu::Limits, adapter: wgpu::Limits) -> wgpu::Limits {
+    // GPUI publishes this device to same-device renderers. Keep the broad
+    // downlevel baseline, but expose a small, bounded amount of the adapter's
+    // storage capacity so those renderers can create their compute pipelines.
+    const MAX_EXTERNAL_STORAGE_BUFFERS_PER_STAGE: u32 = 8;
+    wgpu::Limits {
+        max_storage_buffers_per_shader_stage: required.max_storage_buffers_per_shader_stage.max(
+            adapter
+                .max_storage_buffers_per_shader_stage
+                .min(MAX_EXTERNAL_STORAGE_BUFFERS_PER_STAGE),
+        ),
+        ..required
+    }
+}
+
 #[cfg(not(target_family = "wasm"))]
 fn parse_pci_id(id: &str) -> anyhow::Result<u32> {
     let mut id = id.trim();
@@ -627,7 +643,34 @@ fn parse_pci_id(id: &str) -> anyhow::Result<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_pci_id;
+    use super::{limits_for_external_clients, parse_pci_id};
+
+    #[test]
+    fn external_clients_receive_storage_buffer_capacity_when_available() {
+        let required = wgpu::Limits {
+            max_storage_buffers_per_shader_stage: 4,
+            ..wgpu::Limits::downlevel_defaults()
+        };
+        let adapter = wgpu::Limits {
+            max_storage_buffers_per_shader_stage: 85,
+            ..wgpu::Limits::default()
+        };
+        assert_eq!(
+            limits_for_external_clients(required.clone(), adapter.clone())
+                .max_storage_buffers_per_shader_stage,
+            8
+        );
+
+        let constrained_adapter = wgpu::Limits {
+            max_storage_buffers_per_shader_stage: 4,
+            ..adapter
+        };
+        assert_eq!(
+            limits_for_external_clients(required, constrained_adapter)
+                .max_storage_buffers_per_shader_stage,
+            4
+        );
+    }
 
     #[test]
     fn test_parse_device_id() {
