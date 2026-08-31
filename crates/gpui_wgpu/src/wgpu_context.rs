@@ -1,3 +1,4 @@
+use crate::external_texture::WgpuCompletionPoller;
 #[cfg(not(target_family = "wasm"))]
 use anyhow::Context as _;
 use gpui::ExternalGpuDeviceToken;
@@ -19,6 +20,7 @@ pub struct WgpuContext {
     color_texture_format: wgpu::TextureFormat,
     device_lost: Arc<AtomicBool>,
     external_device_token: ExternalGpuDeviceToken,
+    completion_poller: WgpuCompletionPoller,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -162,16 +164,20 @@ impl WgpuContext {
         );
 
         let backend = WgpuBackend::Native(adapter.get_info().backend);
+        let device = Arc::new(device);
+        let completion_poller =
+            WgpuCompletionPoller::new(Arc::clone(&device), Arc::clone(&device_lost))?;
         Ok(Self {
             instance,
             adapter,
-            device: Arc::new(device),
+            device,
             queue: Arc::new(queue),
             backend,
             dual_source_blending,
             color_texture_format,
             device_lost,
             external_device_token,
+            completion_poller,
         })
     }
 
@@ -254,16 +260,20 @@ impl WgpuContext {
             device.limits(),
         );
 
+        let device = Arc::new(device);
+        let completion_poller =
+            WgpuCompletionPoller::new(Arc::clone(&device), Arc::clone(&device_lost))?;
         let context = Self {
             instance,
             adapter,
-            device: Arc::new(device),
+            device,
             queue: Arc::new(queue),
             backend,
             dual_source_blending,
             color_texture_format,
             device_lost,
             external_device_token: Self::fresh_external_device_token(),
+            completion_poller,
         };
         Ok(PreparedWebGraphics { context, surface })
     }
@@ -591,6 +601,10 @@ impl WgpuContext {
 
     pub(crate) fn external_device_token(&self) -> ExternalGpuDeviceToken {
         self.external_device_token
+    }
+
+    pub(crate) fn completion_poller(&self) -> WgpuCompletionPoller {
+        self.completion_poller.clone()
     }
 
     /// Returns true if the GPU device was lost (e.g., due to driver crash, suspend/resume).

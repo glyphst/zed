@@ -6,10 +6,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges,
-    ExternalTextureHandle, Hsla, Pixels, Point, Radians, ScaledPixels, Size,
-    bounds_tree::BoundsTree, point,
+    ExternalTextureHandle, ExternalTextureId, ExternalTextureSampleReservation, Hsla, Pixels,
+    Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
 };
 use std::{
+    collections::HashMap,
     fmt::Debug,
     iter::Peekable,
     ops::{Add, Range, Sub},
@@ -51,6 +52,7 @@ pub struct Scene {
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub external_textures: Vec<PaintExternalTexture>,
+    external_texture_samples: HashMap<ExternalTextureId, Option<ExternalTextureSampleReservation>>,
     pub surfaces: Vec<PaintSurface>,
 }
 
@@ -68,6 +70,7 @@ impl Scene {
         self.subpixel_sprites.clear();
         self.polychrome_sprites.clear();
         self.external_textures.clear();
+        self.external_texture_samples.clear();
         self.surfaces.clear();
     }
 
@@ -134,6 +137,9 @@ impl Scene {
             }
             Primitive::ExternalTexture(texture) => {
                 texture.order = order;
+                self.external_texture_samples
+                    .entry(texture.texture.id())
+                    .or_insert_with(|| texture.texture.try_reserve_sample());
                 self.external_textures.push(texture.clone());
             }
             Primitive::Surface(surface) => {
@@ -168,6 +174,20 @@ impl Scene {
             .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
         self.external_textures.sort_by_key(|texture| texture.order);
         self.surfaces.sort_by_key(|surface| surface.order);
+    }
+
+    /// Returns the scene-time sample reservation for each distinct external texture.
+    ///
+    /// A `None` reservation means an external writer won the race before this
+    /// scene was built; a renderer must reject that stale frame rather than
+    /// sample potentially newer pixels with the old scene geometry.
+    #[doc(hidden)]
+    pub fn external_texture_sample_reservations(
+        &self,
+    ) -> impl Iterator<Item = (ExternalTextureId, Option<&ExternalTextureSampleReservation>)> {
+        self.external_texture_samples
+            .iter()
+            .map(|(id, reservation)| (*id, reservation.as_ref()))
     }
 
     #[cfg_attr(
@@ -1125,5 +1145,52 @@ mod tests {
         scene.clear();
         assert!(scene.external_textures.is_empty());
         assert_eq!(scene.len(), 0);
+    }
+
+    #[test]
+    fn external_texture_scene_and_replay_reserve_samples() {
+        let bounds = Bounds {
+            origin: Point::new(ScaledPixels(0.0), ScaledPixels(0.0)),
+            size: Size {
+                width: ScaledPixels(10.0),
+                height: ScaledPixels(10.0),
+            },
+        };
+        let texture = ExternalTextureHandle::new(ExternalGpuDeviceToken::new(2, 1), ());
+        let primitive = PaintExternalTexture {
+            order: 0,
+            bounds,
+            content_mask: ContentMask { bounds },
+            source_bounds: Bounds {
+                origin: Point::new(0.0, 0.0),
+                size: Size {
+                    width: 1.0,
+                    height: 1.0,
+                },
+            },
+            opacity: 1.0,
+            filtering: ExternalTextureFilter::Nearest,
+            color_space: ExternalTextureColorSpace::Srgb,
+            alpha_mode: ExternalTextureAlphaMode::Premultiplied,
+            color_effect: ExternalTextureColorEffect::None,
+            texture: texture.clone(),
+        };
+
+        let mut first = Scene::default();
+        first.insert_primitive(primitive);
+        assert!(texture.try_reserve_write().is_none());
+        let first_sample = first
+            .external_texture_sample_reservations()
+            .next()
+            .and_then(|(_, sample)| sample)
+            .expect("first scene reservation");
+        drop(first_sample.claim_submission().expect("first submission"));
+        assert!(texture.try_reserve_write().is_some());
+
+        let mut replayed = Scene::default();
+        replayed.replay(0..first.len(), &first);
+        assert!(texture.try_reserve_write().is_none());
+        replayed.clear();
+        assert!(texture.try_reserve_write().is_some());
     }
 }

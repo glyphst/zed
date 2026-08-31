@@ -3,11 +3,204 @@ use std::{
     fmt,
     sync::{
         Arc, Weak,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU8, AtomicU64, Ordering},
     },
 };
 
 static NEXT_EXTERNAL_TEXTURE_ID: AtomicU64 = AtomicU64::new(1);
+const EXTERNAL_TEXTURE_WRITE_RESERVED: u64 = 1 << 63;
+const EXTERNAL_TEXTURE_SAMPLE_COUNT: u64 = !EXTERNAL_TEXTURE_WRITE_RESERVED;
+const SAMPLE_PENDING: u8 = 0;
+const SAMPLE_SUBMITTED: u8 = 1;
+const SAMPLE_COMPLETE: u8 = 2;
+
+#[derive(Default)]
+struct ExternalTextureAccess {
+    state: AtomicU64,
+}
+
+impl ExternalTextureAccess {
+    fn try_reserve_sample(self: &Arc<Self>) -> Option<ExternalTextureSampleReservation> {
+        let mut observed = self.state.load(Ordering::Acquire);
+        loop {
+            if observed & EXTERNAL_TEXTURE_WRITE_RESERVED != 0
+                || observed & EXTERNAL_TEXTURE_SAMPLE_COUNT == EXTERNAL_TEXTURE_SAMPLE_COUNT
+            {
+                return None;
+            }
+            match self.state.compare_exchange_weak(
+                observed,
+                observed + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(ExternalTextureSampleReservation {
+                        inner: Arc::new(ExternalTextureSampleReservationInner {
+                            access: Arc::clone(self),
+                            state: AtomicU8::new(SAMPLE_PENDING),
+                        }),
+                    });
+                }
+                Err(current) => observed = current,
+            }
+        }
+    }
+
+    fn try_reserve_write(self: &Arc<Self>) -> Option<ExternalTextureWriteReservation> {
+        self.state
+            .compare_exchange(
+                0,
+                EXTERNAL_TEXTURE_WRITE_RESERVED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .ok()
+            .map(|_| ExternalTextureWriteReservation {
+                access: Arc::clone(self),
+                active: true,
+            })
+    }
+
+    fn release_sample(&self) {
+        let previous = self.state.fetch_sub(1, Ordering::AcqRel);
+        debug_assert_eq!(previous & EXTERNAL_TEXTURE_WRITE_RESERVED, 0);
+        debug_assert_ne!(previous & EXTERNAL_TEXTURE_SAMPLE_COUNT, 0);
+    }
+
+    fn release_write(&self) {
+        let previous = self
+            .state
+            .fetch_and(!EXTERNAL_TEXTURE_WRITE_RESERVED, Ordering::AcqRel);
+        debug_assert_eq!(previous, EXTERNAL_TEXTURE_WRITE_RESERVED);
+    }
+}
+
+struct ExternalTextureSampleReservationInner {
+    access: Arc<ExternalTextureAccess>,
+    state: AtomicU8,
+}
+
+impl ExternalTextureSampleReservationInner {
+    fn complete(&self) {
+        if self.state.swap(SAMPLE_COMPLETE, Ordering::AcqRel) != SAMPLE_COMPLETE {
+            self.access.release_sample();
+        }
+    }
+}
+
+impl Drop for ExternalTextureSampleReservationInner {
+    fn drop(&mut self) {
+        self.complete();
+    }
+}
+
+/// One pending or submitted scene use of an external texture.
+///
+/// This is an internal renderer hand-off exposed only so platform backends can
+/// keep the texture read reservation alive through GPU completion.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct ExternalTextureSampleReservation {
+    inner: Arc<ExternalTextureSampleReservationInner>,
+}
+
+impl ExternalTextureSampleReservation {
+    /// Claims the scene's pending reservation for one compositor submission.
+    #[doc(hidden)]
+    pub fn claim_submission(&self) -> Option<ExternalTextureSampleSubmission> {
+        self.inner
+            .state
+            .compare_exchange(
+                SAMPLE_PENDING,
+                SAMPLE_SUBMITTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .ok()
+            .map(|_| ExternalTextureSampleSubmission {
+                reservation: self.clone(),
+            })
+    }
+
+    /// Acquires an independent reservation when the same scene is submitted again.
+    #[doc(hidden)]
+    pub fn fresh_submission(&self) -> Option<ExternalTextureSampleSubmission> {
+        let reservation = self.inner.access.try_reserve_sample()?;
+        reservation.claim_submission()
+    }
+}
+
+impl fmt::Debug for ExternalTextureSampleReservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ExternalTextureSampleReservation")
+            .field("state", &self.inner.state.load(Ordering::Acquire))
+            .finish()
+    }
+}
+
+/// Keeps one external-texture sample reserved until a compositor submission completes.
+///
+/// Platform backends move this value into their queue-completion callback. If
+/// command recording or submission fails, dropping it releases the reservation.
+#[doc(hidden)]
+pub struct ExternalTextureSampleSubmission {
+    reservation: ExternalTextureSampleReservation,
+}
+
+impl Drop for ExternalTextureSampleSubmission {
+    fn drop(&mut self) {
+        self.reservation.inner.complete();
+    }
+}
+
+impl fmt::Debug for ExternalTextureSampleSubmission {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ExternalTextureSampleSubmission")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Exclusive permission to enqueue a write to an external texture.
+///
+/// Call [`Self::mark_submitted`] immediately after the write is submitted to
+/// the same device queue. Later compositor samples are then ordered after that
+/// write. Dropping an unsubmitted reservation safely cancels it.
+pub struct ExternalTextureWriteReservation {
+    access: Arc<ExternalTextureAccess>,
+    active: bool,
+}
+
+impl ExternalTextureWriteReservation {
+    /// Records that the reserved write has been submitted and releases the queue-order barrier.
+    pub fn mark_submitted(mut self) {
+        self.release();
+    }
+
+    fn release(&mut self) {
+        if self.active {
+            self.access.release_write();
+            self.active = false;
+        }
+    }
+}
+
+impl Drop for ExternalTextureWriteReservation {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+impl fmt::Debug for ExternalTextureWriteReservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ExternalTextureWriteReservation")
+            .field("active", &self.active)
+            .finish_non_exhaustive()
+    }
+}
 
 /// Identifies one GPU device and its recovery generation.
 ///
@@ -114,6 +307,7 @@ pub struct ExternalTextureHandle {
     id: ExternalTextureId,
     token: ExternalGpuDeviceToken,
     payload: Arc<dyn Any + Send + Sync>,
+    access: Arc<ExternalTextureAccess>,
 }
 
 impl ExternalTextureHandle {
@@ -126,6 +320,7 @@ impl ExternalTextureHandle {
             id: ExternalTextureId(NEXT_EXTERNAL_TEXTURE_ID.fetch_add(1, Ordering::Relaxed)),
             token,
             payload: Arc::new(payload),
+            access: Arc::new(ExternalTextureAccess::default()),
         }
     }
 
@@ -146,7 +341,22 @@ impl ExternalTextureHandle {
             id: self.id,
             token: self.token,
             payload: Arc::downgrade(&self.payload),
+            access: Arc::downgrade(&self.access),
         }
+    }
+
+    /// Attempts to reserve this texture for an externally submitted write.
+    ///
+    /// The reservation fails while a GPUI scene references the texture or a
+    /// previous compositor submission is still sampling it.
+    pub fn try_reserve_write(&self) -> Option<ExternalTextureWriteReservation> {
+        self.access.try_reserve_write()
+    }
+
+    /// Reserves one scene sample before it can race an external writer.
+    #[doc(hidden)]
+    pub fn try_reserve_sample(&self) -> Option<ExternalTextureSampleReservation> {
+        self.access.try_reserve_sample()
     }
 
     /// Downcasts the opaque backend payload.
@@ -168,6 +378,7 @@ pub struct WeakExternalTextureHandle {
     id: ExternalTextureId,
     token: ExternalGpuDeviceToken,
     payload: Weak<dyn Any + Send + Sync>,
+    access: Weak<ExternalTextureAccess>,
 }
 
 impl WeakExternalTextureHandle {
@@ -183,10 +394,13 @@ impl WeakExternalTextureHandle {
 
     /// Upgrades this reference while the external texture is still retained.
     pub fn upgrade(&self) -> Option<ExternalTextureHandle> {
-        self.payload.upgrade().map(|payload| ExternalTextureHandle {
+        let payload = self.payload.upgrade()?;
+        let access = self.access.upgrade()?;
+        Some(ExternalTextureHandle {
             id: self.id,
             token: self.token,
             payload,
+            access,
         })
     }
 
@@ -257,5 +471,44 @@ mod tests {
 
         assert!(!weak.is_alive());
         assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn scene_samples_and_external_writes_are_mutually_exclusive() {
+        let texture = ExternalTextureHandle::new(ExternalGpuDeviceToken::new(10, 1), ());
+
+        let sample = texture.try_reserve_sample().expect("scene sample");
+        assert!(texture.try_reserve_write().is_none());
+        let submission = sample.claim_submission().expect("first submission");
+        assert!(sample.claim_submission().is_none());
+        drop(submission);
+
+        let write = texture.try_reserve_write().expect("write after sample");
+        assert!(texture.try_reserve_sample().is_none());
+        write.mark_submitted();
+        assert!(texture.try_reserve_sample().is_some());
+    }
+
+    #[test]
+    fn repeated_scene_submission_owns_an_independent_sample() {
+        let texture = ExternalTextureHandle::new(ExternalGpuDeviceToken::new(11, 1), ());
+        let sample = texture.try_reserve_sample().expect("scene sample");
+        drop(sample.claim_submission().expect("first submission"));
+
+        let repeated = sample.fresh_submission().expect("repeated submission");
+        assert!(texture.try_reserve_write().is_none());
+        drop(repeated);
+        assert!(texture.try_reserve_write().is_some());
+    }
+
+    #[test]
+    fn dropping_unsubmitted_reservations_releases_the_texture() {
+        let texture = ExternalTextureHandle::new(ExternalGpuDeviceToken::new(12, 1), ());
+        drop(texture.try_reserve_sample().expect("scene sample"));
+        assert!(texture.try_reserve_write().is_some());
+
+        let write = texture.try_reserve_write().expect("write reservation");
+        drop(write);
+        assert!(texture.try_reserve_sample().is_some());
     }
 }

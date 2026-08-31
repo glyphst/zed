@@ -1,11 +1,12 @@
-use crate::external_texture::WgpuExternalTexture;
+use crate::external_texture::{WgpuCompletionPoller, WgpuExternalTexture};
 use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext, WgpuExternalContext};
 use anyhow::{Context as _, Result};
 use bytemuck::{Pod, Zeroable};
 use gpui::{
     AtlasTextureId, Background, Bounds, DevicePixels, ExternalGpuContext, ExternalGpuDeviceToken,
-    ExternalTextureFilter, ExternalTextureId, GpuSpecs, Path, Point, PrimitiveBatch, ScaledPixels,
-    Scene, Size, WeakExternalTextureHandle, get_gamma_correction_ratios,
+    ExternalTextureFilter, ExternalTextureId, ExternalTextureSampleSubmission, GpuSpecs, Path,
+    Point, PrimitiveBatch, ScaledPixels, Scene, Size, WeakExternalTextureHandle,
+    get_gamma_correction_ratios,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -264,6 +265,7 @@ pub struct WgpuRenderer {
     failed_frame_count: u32,
     device_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
     external_device_token: ExternalGpuDeviceToken,
+    completion_poller: WgpuCompletionPoller,
     surface_configured: bool,
     needs_redraw: bool,
 }
@@ -652,6 +654,7 @@ impl WgpuRenderer {
             failed_frame_count: 0,
             device_lost: context.device_lost_flag(),
             external_device_token: context.external_device_token(),
+            completion_poller: context.completion_poller(),
             surface_configured: true,
             needs_redraw: false,
         })
@@ -1332,6 +1335,7 @@ impl WgpuRenderer {
                 Arc::clone(&resources.queue),
                 self.external_device_token,
                 Arc::clone(&self.device_lost),
+                self.completion_poller.clone(),
             ),
         )
     }
@@ -1481,6 +1485,7 @@ impl WgpuRenderer {
     }
 
     fn record_frame(&mut self, scene: &Scene, frame_view: &wgpu::TextureView) -> Result<()> {
+        let external_samples = self.acquire_external_texture_samples(scene)?;
         self.prepare_external_texture_bind_groups(scene)?;
         let mut instance_offset = 0;
         let instance_bindings = self
@@ -1619,9 +1624,12 @@ impl WgpuRenderer {
             }
         }
 
-        self.resources()
-            .queue
-            .submit(std::iter::once(encoder.finish()));
+        let queue = Arc::clone(&self.resources().queue);
+        queue.submit(std::iter::once(encoder.finish()));
+        if !external_samples.is_empty() {
+            queue.on_submitted_work_done(move || drop(external_samples));
+            self.completion_poller.request();
+        }
         Ok(())
     }
 
@@ -1770,6 +1778,32 @@ impl WgpuRenderer {
             .external_texture_bind_groups
             .retain(|_, entry| entry.lifetime.is_alive());
         Ok(())
+    }
+
+    fn acquire_external_texture_samples(
+        &self,
+        scene: &Scene,
+    ) -> Result<Vec<ExternalTextureSampleSubmission>> {
+        let mut submissions = Vec::new();
+        for (id, reservation) in scene.external_texture_sample_reservations() {
+            let reservation = reservation.with_context(|| {
+                format!(
+                    "external texture {} was reserved for writing before this scene was built",
+                    id.as_u64()
+                )
+            })?;
+            let submission = reservation
+                .claim_submission()
+                .or_else(|| reservation.fresh_submission())
+                .with_context(|| {
+                    format!(
+                        "external texture {} is still sampled or reserved for writing",
+                        id.as_u64()
+                    )
+                })?;
+            submissions.push(submission);
+        }
+        Ok(submissions)
     }
 
     fn draw_instances(
