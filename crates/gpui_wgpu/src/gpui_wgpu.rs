@@ -5,7 +5,7 @@ mod wgpu_context;
 mod wgpu_renderer;
 
 pub use cosmic_text_system::*;
-pub use external_texture::WgpuExternalContext;
+pub use external_texture::{WgpuExternalContext, WgpuExternalRender, WgpuExternalRenderContext};
 pub use wgpu;
 pub use wgpu_atlas::*;
 pub use wgpu_context::*;
