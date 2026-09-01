@@ -6,8 +6,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges,
-    ExternalTextureHandle, ExternalTextureId, ExternalTextureSampleReservation, Hsla, Pixels,
-    Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
+    ExternalGpuRenderHandle, ExternalTextureHandle, ExternalTextureId,
+    ExternalTextureSampleReservation, Hsla, Pixels, Point, Radians, ScaledPixels, Size,
+    bounds_tree::BoundsTree, point,
 };
 use std::{
     collections::HashMap,
@@ -52,6 +53,7 @@ pub struct Scene {
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub external_textures: Vec<PaintExternalTexture>,
+    pub external_gpu_renders: Vec<PaintExternalGpu>,
     external_texture_samples: HashMap<ExternalTextureId, Option<ExternalTextureSampleReservation>>,
     pub surfaces: Vec<PaintSurface>,
 }
@@ -70,6 +72,7 @@ impl Scene {
         self.subpixel_sprites.clear();
         self.polychrome_sprites.clear();
         self.external_textures.clear();
+        self.external_gpu_renders.clear();
         self.external_texture_samples.clear();
         self.surfaces.clear();
     }
@@ -142,6 +145,10 @@ impl Scene {
                     .or_insert_with(|| texture.texture.try_reserve_sample());
                 self.external_textures.push(texture.clone());
             }
+            Primitive::ExternalGpu(render) => {
+                render.order = order;
+                self.external_gpu_renders.push(render.clone());
+            }
             Primitive::Surface(surface) => {
                 surface.order = order;
                 self.surfaces.push(surface.clone());
@@ -173,6 +180,7 @@ impl Scene {
         self.polychrome_sprites
             .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
         self.external_textures.sort_by_key(|texture| texture.order);
+        self.external_gpu_renders.sort_by_key(|render| render.order);
         self.surfaces.sort_by_key(|surface| surface.order);
     }
 
@@ -215,6 +223,8 @@ impl Scene {
             polychrome_sprites_iter: self.polychrome_sprites.iter().peekable(),
             external_textures_start: 0,
             external_textures_iter: self.external_textures.iter().peekable(),
+            external_gpu_renders_start: 0,
+            external_gpu_renders_iter: self.external_gpu_renders.iter().peekable(),
             surfaces_start: 0,
             surfaces_iter: self.surfaces.iter().peekable(),
         }
@@ -239,6 +249,7 @@ pub(crate) enum PrimitiveKind {
     SubpixelSprite,
     PolychromeSprite,
     ExternalTexture,
+    ExternalGpu,
     Surface,
 }
 
@@ -259,6 +270,7 @@ pub enum Primitive {
     SubpixelSprite(SubpixelSprite),
     PolychromeSprite(PolychromeSprite),
     ExternalTexture(PaintExternalTexture),
+    ExternalGpu(PaintExternalGpu),
     Surface(PaintSurface),
 }
 
@@ -274,6 +286,7 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.bounds,
             Primitive::PolychromeSprite(sprite) => &sprite.bounds,
             Primitive::ExternalTexture(texture) => &texture.bounds,
+            Primitive::ExternalGpu(render) => &render.bounds,
             Primitive::Surface(surface) => &surface.bounds,
         }
     }
@@ -288,6 +301,7 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.content_mask,
             Primitive::PolychromeSprite(sprite) => &sprite.content_mask,
             Primitive::ExternalTexture(texture) => &texture.content_mask,
+            Primitive::ExternalGpu(render) => &render.content_mask,
             Primitive::Surface(surface) => &surface.content_mask,
         }
     }
@@ -317,6 +331,8 @@ struct BatchIterator<'a> {
     polychrome_sprites_iter: Peekable<slice::Iter<'a, PolychromeSprite>>,
     external_textures_start: usize,
     external_textures_iter: Peekable<slice::Iter<'a, PaintExternalTexture>>,
+    external_gpu_renders_start: usize,
+    external_gpu_renders_iter: Peekable<slice::Iter<'a, PaintExternalGpu>>,
     surfaces_start: usize,
     surfaces_iter: Peekable<slice::Iter<'a, PaintSurface>>,
 }
@@ -351,6 +367,10 @@ impl<'a> Iterator for BatchIterator<'a> {
             (
                 self.external_textures_iter.peek().map(|t| t.order),
                 PrimitiveKind::ExternalTexture,
+            ),
+            (
+                self.external_gpu_renders_iter.peek().map(|r| r.order),
+                PrimitiveKind::ExternalGpu,
             ),
             (
                 self.surfaces_iter.peek().map(|s| s.order),
@@ -503,6 +523,22 @@ impl<'a> Iterator for BatchIterator<'a> {
                     textures_start..textures_end,
                 ))
             }
+            PrimitiveKind::ExternalGpu => {
+                let renders_start = self.external_gpu_renders_start;
+                let mut renders_end = renders_start + 1;
+                self.external_gpu_renders_iter.next();
+                while self
+                    .external_gpu_renders_iter
+                    .next_if(|render| (render.order, batch_kind) < max_order_and_kind)
+                    .is_some()
+                {
+                    renders_end += 1;
+                }
+                self.external_gpu_renders_start = renders_end;
+                Some(PrimitiveBatch::ExternalGpuRenders(
+                    renders_start..renders_end,
+                ))
+            }
             PrimitiveKind::Surface => {
                 let surfaces_start = self.surfaces_start;
                 let mut surfaces_end = surfaces_start + 1;
@@ -549,6 +585,7 @@ pub enum PrimitiveBatch {
         range: Range<usize>,
     },
     ExternalTextures(Range<usize>),
+    ExternalGpuRenders(Range<usize>),
     Surfaces(Range<usize>),
 }
 
@@ -582,6 +619,9 @@ impl PrimitiveBatch {
                 )
             }
             Self::ExternalTextures(range) => format!("external textures ({})", range.len()),
+            Self::ExternalGpuRenders(range) => {
+                format!("external GPU renders ({})", range.len())
+            }
             Self::Surfaces(range) => format!("surfaces ({})", range.len()),
         }
     }
@@ -899,6 +939,25 @@ impl From<PaintExternalTexture> for Primitive {
     }
 }
 
+/// An externally implemented GPU renderer placed into GPUI's ordered scene.
+#[derive(Clone, Debug)]
+pub struct PaintExternalGpu {
+    /// Painter order assigned when the primitive is inserted into a scene.
+    pub order: DrawOrder,
+    /// Destination bounds in device-scaled pixels.
+    pub bounds: Bounds<ScaledPixels>,
+    /// Destination clip bounds in device-scaled pixels.
+    pub content_mask: ContentMask<ScaledPixels>,
+    /// Opaque backend render callback.
+    pub render: ExternalGpuRenderHandle,
+}
+
+impl From<PaintExternalGpu> for Primitive {
+    fn from(render: PaintExternalGpu) -> Self {
+        Primitive::ExternalGpu(render)
+    }
+}
+
 #[derive(Clone, Debug)]
 #[allow(missing_docs)]
 pub struct PaintSurface {
@@ -1087,7 +1146,7 @@ impl PathVertex<Pixels> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ExternalGpuDeviceToken, ExternalTextureHandle};
+    use crate::{ExternalGpuDeviceToken, ExternalGpuRenderHandle, ExternalTextureHandle};
 
     #[test]
     fn external_textures_keep_overlapping_painter_order() {
@@ -1124,6 +1183,12 @@ mod tests {
             color_effect: ExternalTextureColorEffect::InvertRgb,
             texture: ExternalTextureHandle::new(ExternalGpuDeviceToken::new(1, 1), ()),
         });
+        scene.insert_primitive(PaintExternalGpu {
+            order: 0,
+            bounds,
+            content_mask,
+            render: ExternalGpuRenderHandle::new(ExternalGpuDeviceToken::new(1, 1), ()),
+        });
         scene.insert_primitive(Quad {
             bounds,
             content_mask,
@@ -1140,10 +1205,19 @@ mod tests {
             .batches()
             .map(|batch| batch.label())
             .collect::<Vec<_>>();
-        assert_eq!(labels, ["quads (1)", "external textures (1)", "quads (1)"]);
+        assert_eq!(
+            labels,
+            [
+                "quads (1)",
+                "external textures (1)",
+                "external GPU renders (1)",
+                "quads (1)"
+            ]
+        );
 
         scene.clear();
         assert!(scene.external_textures.is_empty());
+        assert!(scene.external_gpu_renders.is_empty());
         assert_eq!(scene.len(), 0);
     }
 

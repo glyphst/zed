@@ -732,6 +732,7 @@ impl MetalRenderer {
                     command_encoder,
                 ),
                 PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
+                PrimitiveBatch::ExternalTextures(_) | PrimitiveBatch::ExternalGpuRenders(_) => {}
             }
         }
 

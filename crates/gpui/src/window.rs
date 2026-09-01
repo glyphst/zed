@@ -12,17 +12,17 @@ use crate::{
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
     Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
     KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite,
-    MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, PaintExternalTexture, Path, Pixels,
-    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
-    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
-    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
-    StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
-    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextInputConfiguration,
-    TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix,
-    Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
-    WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem, point,
-    prelude::*, px, rems, size, transparent_black,
+    MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, PaintExternalGpu, PaintExternalTexture,
+    Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
+    PlatformWindow, Point, PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render,
+    RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge,
+    SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow,
+    SharedString, Size, StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription,
+    SystemWindowTab, SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task,
+    TextInputConfiguration, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
+    TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
+    WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
+    point, prelude::*, px, rems, size, transparent_black,
 };
 
 use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
@@ -4681,6 +4681,39 @@ impl Window {
                 color_effect,
                 texture,
             });
+        Ok(())
+    }
+
+    /// Runs an externally implemented GPU renderer at the current painter order.
+    ///
+    /// The renderer must belong to the device token returned by
+    /// [`Self::external_gpu_context`]. Backends that do not expose such a
+    /// context cannot create a compatible handle.
+    pub fn paint_external_gpu(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        render: crate::ExternalGpuRenderHandle,
+    ) -> Result<()> {
+        self.invalidator.debug_assert_paint();
+        let context = self
+            .external_gpu_context()
+            .ok_or_else(|| anyhow!("this window does not expose an external GPU context"))?;
+        if render.token() != context.token() {
+            return Err(anyhow!(
+                "external GPU renderer belongs to device {:?}, but this window uses {:?}",
+                render.token(),
+                context.token(),
+            ));
+        }
+        if bounds.size.width <= Pixels::ZERO || bounds.size.height <= Pixels::ZERO {
+            return Ok(());
+        }
+        self.next_frame.scene.insert_primitive(PaintExternalGpu {
+            order: 0,
+            bounds: self.snap_bounds(bounds),
+            content_mask: self.snapped_content_mask(),
+            render,
+        });
         Ok(())
     }
 

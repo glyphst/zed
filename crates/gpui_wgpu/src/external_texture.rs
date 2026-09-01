@@ -1,4 +1,7 @@
-use gpui::{ExternalGpuContext, ExternalGpuDeviceToken, ExternalTextureHandle};
+use gpui::{
+    Bounds, ContentMask, ExternalGpuContext, ExternalGpuDeviceToken, ExternalGpuRenderHandle,
+    ExternalTextureHandle, ScaledPixels,
+};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -72,6 +75,7 @@ pub struct WgpuExternalContext {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
     token: ExternalGpuDeviceToken,
+    surface_format: wgpu::TextureFormat,
     device_lost: Arc<AtomicBool>,
     completion_poller: WgpuCompletionPoller,
 }
@@ -81,6 +85,7 @@ impl WgpuExternalContext {
         device: Arc<wgpu::Device>,
         queue: Arc<wgpu::Queue>,
         token: ExternalGpuDeviceToken,
+        surface_format: wgpu::TextureFormat,
         device_lost: Arc<AtomicBool>,
         completion_poller: WgpuCompletionPoller,
     ) -> Self {
@@ -88,6 +93,7 @@ impl WgpuExternalContext {
             device,
             queue,
             token,
+            surface_format,
             device_lost,
             completion_poller,
         }
@@ -113,6 +119,11 @@ impl WgpuExternalContext {
         self.token
     }
 
+    /// Returns the color format of the current GPUI presentation target.
+    pub const fn surface_format(&self) -> wgpu::TextureFormat {
+        self.surface_format
+    }
+
     /// Returns whether GPUI has observed this WGPU device being lost.
     pub fn is_device_lost(&self) -> bool {
         self.device_lost.load(Ordering::Relaxed)
@@ -133,6 +144,30 @@ impl WgpuExternalContext {
     pub fn texture_handle(&self, view: Arc<wgpu::TextureView>) -> ExternalTextureHandle {
         ExternalTextureHandle::new(self.token, WgpuExternalTexture { view })
     }
+
+    /// Wraps a WGPU callback for painter-ordered execution in GPUI's frame encoder.
+    pub fn render_handle(&self, render: Arc<dyn WgpuExternalRender>) -> ExternalGpuRenderHandle {
+        ExternalGpuRenderHandle::new(self.token, WgpuExternalRenderPayload { render })
+    }
+}
+
+/// The current GPUI WGPU target exposed to one painter-ordered external renderer.
+pub struct WgpuExternalRenderContext<'a> {
+    pub encoder: &'a mut wgpu::CommandEncoder,
+    pub target: &'a wgpu::TextureView,
+    pub target_format: wgpu::TextureFormat,
+    pub target_size: [u32; 2],
+    pub bounds: Bounds<ScaledPixels>,
+    pub content_mask: ContentMask<ScaledPixels>,
+}
+
+/// Records trusted same-device commands into GPUI's current frame.
+pub trait WgpuExternalRender: Send + Sync {
+    fn render(&self, context: &mut WgpuExternalRenderContext<'_>) -> anyhow::Result<()>;
+}
+
+pub(crate) struct WgpuExternalRenderPayload {
+    pub(crate) render: Arc<dyn WgpuExternalRender>,
 }
 
 pub(crate) struct WgpuExternalTexture {

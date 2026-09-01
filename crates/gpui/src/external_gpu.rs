@@ -287,6 +287,52 @@ impl fmt::Debug for ExternalGpuContext {
     }
 }
 
+/// An opaque, reference-counted GPU render callback owned by an external backend.
+///
+/// The payload is interpreted only by the matching platform renderer. Device
+/// tokens prevent a callback from recording commands against a recovered or
+/// unrelated GPU device.
+#[derive(Clone)]
+pub struct ExternalGpuRenderHandle {
+    token: ExternalGpuDeviceToken,
+    payload: Arc<dyn Any + Send + Sync>,
+}
+
+impl ExternalGpuRenderHandle {
+    /// Wraps a backend-owned renderer for painter-ordered execution.
+    pub fn new<T>(token: ExternalGpuDeviceToken, payload: T) -> Self
+    where
+        T: Any + Send + Sync,
+    {
+        Self {
+            token,
+            payload: Arc::new(payload),
+        }
+    }
+
+    /// Returns the GPU device and recovery generation required by this renderer.
+    pub const fn token(&self) -> ExternalGpuDeviceToken {
+        self.token
+    }
+
+    /// Downcasts the opaque backend payload.
+    pub fn downcast_ref<T>(&self) -> Option<&T>
+    where
+        T: Any + Send + Sync,
+    {
+        self.payload.downcast_ref()
+    }
+}
+
+impl fmt::Debug for ExternalGpuRenderHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ExternalGpuRenderHandle")
+            .field("token", &self.token)
+            .finish_non_exhaustive()
+    }
+}
+
 /// A process-local identifier for an externally owned texture.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ExternalTextureId(u64);

@@ -1,4 +1,6 @@
-use crate::external_texture::{WgpuCompletionPoller, WgpuExternalTexture};
+use crate::external_texture::{
+    WgpuCompletionPoller, WgpuExternalRenderContext, WgpuExternalRenderPayload, WgpuExternalTexture,
+};
 use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext, WgpuExternalContext};
 use anyhow::{Context as _, Result};
 use bytemuck::{Pod, Zeroable};
@@ -1334,6 +1336,7 @@ impl WgpuRenderer {
                 Arc::clone(&resources.device),
                 Arc::clone(&resources.queue),
                 self.external_device_token,
+                self.surface_config.format,
                 Arc::clone(&self.device_lost),
                 self.completion_poller.clone(),
             ),
@@ -1617,6 +1620,55 @@ impl WgpuRenderer {
                         range,
                         &mut pass,
                     )?,
+                    PrimitiveBatch::ExternalGpuRenders(range) => {
+                        drop(pass);
+                        for index in range {
+                            let render = &scene.external_gpu_renders[index];
+                            if render.render.token() != self.external_device_token {
+                                log::error!(
+                                    "external GPU renderer belongs to device {:?}, but this window uses {:?}",
+                                    render.render.token(),
+                                    self.external_device_token,
+                                );
+                                continue;
+                            }
+                            let Some(payload) =
+                                render.render.downcast_ref::<WgpuExternalRenderPayload>()
+                            else {
+                                log::error!("external GPU renderer is not a WGPU payload");
+                                continue;
+                            };
+                            let mut context = WgpuExternalRenderContext {
+                                encoder: &mut encoder,
+                                target: frame_view,
+                                target_format: self.surface_config.format,
+                                target_size: [
+                                    self.surface_config.width,
+                                    self.surface_config.height,
+                                ],
+                                bounds: render.bounds,
+                                content_mask: render.content_mask,
+                            };
+                            if let Err(error) = payload.render.render(&mut context) {
+                                log::error!("external GPU render failed: {error:#}");
+                            }
+                        }
+
+                        pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("main_pass_continued"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: frame_view,
+                                resolve_target: None,
+                                ops: wgpu::Operations {
+                                    load: wgpu::LoadOp::Load,
+                                    store: wgpu::StoreOp::Store,
+                                },
+                                depth_slice: None,
+                            })],
+                            depth_stencil_attachment: None,
+                            ..Default::default()
+                        });
+                    }
                     // Surfaces are macOS-only for video playback and are not
                     // implemented by the WGPU renderer.
                     PrimitiveBatch::Surfaces(_surfaces) => {}
