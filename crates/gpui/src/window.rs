@@ -249,6 +249,10 @@ impl WindowInvalidator {
         }
     }
 
+    pub fn platform_wake_suppressed(&self) -> bool {
+        self.inner.borrow().platform_wake_suppressed
+    }
+
     #[cfg(any(feature = "bench-support", test))]
     pub fn set_platform_wake_suppressed(&self, suppressed: bool) {
         let mut inner = self.inner.borrow_mut();
@@ -2382,10 +2386,12 @@ impl Window {
     /// Schedule the given closure to be run directly after the current frame is rendered.
     pub fn on_next_frame(&self, callback: impl FnOnce(&mut Window, &mut App) + 'static) {
         RefCell::borrow_mut(&self.next_frame_callbacks).push(Box::new(callback));
-        self.platform_window.schedule_frame();
-        // Next-frame callbacks create frame demand without dirtying the
-        // window, so the platform's frame source must be woken explicitly.
-        self.invalidator.wake_platform();
+        if !self.invalidator.platform_wake_suppressed() {
+            self.platform_window.schedule_frame();
+            // Next-frame callbacks create frame demand without dirtying the
+            // window, so the platform's frame source must be woken explicitly.
+            self.invalidator.wake_platform();
+        }
     }
 
     /// Schedule a frame to be drawn on the next animation frame.
@@ -2409,7 +2415,7 @@ impl Window {
     ///
     /// Tests have no platform frame loop, so this simulates the delivery of the
     /// next frame.
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
     pub fn simulate_next_frame(&mut self, cx: &mut App) -> usize {
         let callbacks = self.next_frame_callbacks.take();
         let count = callbacks.len();
@@ -3077,7 +3083,12 @@ impl Window {
     /// [`Self::present_if_needed`] themselves.
     #[cfg(feature = "bench-support")]
     pub fn set_platform_frame_wake_suppressed(&self, suppressed: bool) {
+        let was_suppressed = self.invalidator.platform_wake_suppressed();
         self.invalidator.set_platform_wake_suppressed(suppressed);
+        if was_suppressed && !suppressed && !self.next_frame_callbacks.borrow().is_empty() {
+            self.platform_window.schedule_frame();
+            self.invalidator.wake_platform();
+        }
     }
 
     /// Returns a snapshot of the current input-latency histograms.
