@@ -128,6 +128,7 @@ struct WindowInvalidatorInner {
     #[cfg(feature = "profiler")]
     pub frame_dirty: FrameDirtyAccumulator,
     pub platform_waker: Option<Rc<dyn Fn()>>,
+    pub platform_wake_suppressed: bool,
 }
 
 /// Per-frame invalidation bookkeeping, drained at draw time and emitted to the
@@ -160,6 +161,7 @@ impl WindowInvalidator {
                 #[cfg(feature = "profiler")]
                 frame_dirty: FrameDirtyAccumulator::default(),
                 platform_waker: None,
+                platform_wake_suppressed: false,
             })),
         }
     }
@@ -173,7 +175,9 @@ impl WindowInvalidator {
             let dirty_at = Self::record_frame_dirty(&mut inner);
             let became_dirty = !inner.dirty;
             inner.dirty = true;
-            let waker = became_dirty.then(|| inner.platform_waker.clone()).flatten();
+            let waker = (became_dirty && !inner.platform_wake_suppressed)
+                .then(|| inner.platform_waker.clone())
+                .flatten();
             #[cfg(feature = "profiler")]
             let window_id = inner.window_id;
             drop(inner);
@@ -204,7 +208,9 @@ impl WindowInvalidator {
         }
         #[cfg(feature = "profiler")]
         let dirty_at = dirty.then(|| Self::record_frame_dirty(&mut inner));
-        let waker = became_dirty.then(|| inner.platform_waker.clone()).flatten();
+        let waker = (became_dirty && !inner.platform_wake_suppressed)
+            .then(|| inner.platform_waker.clone())
+            .flatten();
         #[cfg(feature = "profiler")]
         let window_id = inner.window_id;
         drop(inner);
@@ -220,7 +226,9 @@ impl WindowInvalidator {
     pub fn set_platform_waker(&self, waker: Option<Rc<dyn Fn()>>) {
         let mut inner = self.inner.borrow_mut();
         inner.platform_waker = waker;
-        let waker = inner.dirty.then(|| inner.platform_waker.clone()).flatten();
+        let waker = (inner.dirty && !inner.platform_wake_suppressed)
+            .then(|| inner.platform_waker.clone())
+            .flatten();
         drop(inner);
         if let Some(waker) = waker {
             waker();
@@ -231,7 +239,23 @@ impl WindowInvalidator {
     /// delivered even if the platform stops requesting frames for idle
     /// windows. No-op on platforms without a frame waker.
     pub fn wake_platform(&self) {
-        let waker = self.inner.borrow().platform_waker.clone();
+        let inner = self.inner.borrow();
+        let waker = (!inner.platform_wake_suppressed)
+            .then(|| inner.platform_waker.clone())
+            .flatten();
+        drop(inner);
+        if let Some(waker) = waker {
+            waker();
+        }
+    }
+
+    #[cfg(any(feature = "bench-support", test))]
+    pub fn set_platform_wake_suppressed(&self, suppressed: bool) {
+        let mut inner = self.inner.borrow_mut();
+        let wake = inner.platform_wake_suppressed && !suppressed && inner.dirty;
+        inner.platform_wake_suppressed = suppressed;
+        let waker = wake.then(|| inner.platform_waker.clone()).flatten();
+        drop(inner);
         if let Some(waker) = waker {
             waker();
         }
@@ -3045,6 +3069,15 @@ impl Window {
         if self.needs_present.get() {
             self.present();
         }
+    }
+
+    /// Prevents dirty-view notifications from also scheduling platform frames.
+    ///
+    /// Synchronous benchmark drivers use this while calling [`Self::draw`] and
+    /// [`Self::present_if_needed`] themselves.
+    #[cfg(feature = "bench-support")]
+    pub fn set_platform_frame_wake_suppressed(&self, suppressed: bool) {
+        self.invalidator.set_platform_wake_suppressed(suppressed);
     }
 
     /// Returns a snapshot of the current input-latency histograms.
@@ -7129,6 +7162,26 @@ mod tests {
     };
 
     struct EmptyView;
+
+    #[gpui::test]
+    fn synchronous_driver_can_suppress_platform_frame_wakes(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| EmptyView);
+        let wakes = Rc::new(Cell::new(0));
+        window
+            .update(cx, |_, window, _| {
+                let wake_count = wakes.clone();
+                window.invalidator.set_platform_waker(Some(Rc::new(move || {
+                    wake_count.set(wake_count.get() + 1)
+                })));
+                window.invalidator.set_dirty(false);
+                window.invalidator.set_platform_wake_suppressed(true);
+                window.invalidator.set_dirty(true);
+                assert_eq!(wakes.get(), 0);
+                window.invalidator.set_platform_wake_suppressed(false);
+            })
+            .unwrap();
+        assert_eq!(wakes.get(), 1);
+    }
 
     impl Render for EmptyView {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
